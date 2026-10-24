@@ -1,14 +1,16 @@
 /* =============================================================================
-   Healthcare BI - Load DW, aligné sur le schéma en constellation de l'équipe
+   Healthcare BI - Load DW OM3 (Prescriptions)  -  VERSION 2
    Base DW : HealthcareDW (schéma dwh)  |  Staging : HealthcareDB_Staging (schéma stg)
 
-   Couvre : les 3 dimensions conformées (DIM_TEMPS, DIM_PATIENT, DIM_SEJOUR),
-            DIM_MEDICAMENT (colonnes du modèle) et F6 = FACT_PRESCRIPTION.
+   Modifications par rapport à la v1  (repérées par [MODIF]) :
+     1. F6 reçoit service_sk -> lien vers DIM_SERVICE (cohérent avec les slides 30-32
+        et avec l'objectif OBI 3.5 "analyse par service")
+     2. DIM_SERVICE : création si absente + ligne "INCONNU" (-1)
+     3. DIM_MEDICAMENT : clé naturelle UNIQUE sur les 4 colonnes (anti-doublons)
+     4. DIM_MEDICAMENT : plus de UPDATE dans SSIS (voir étapes)
+     5. Contrôles supplémentaires
 
-   Ordre dans SSIS :  DIM_TEMPS, DIM_PATIENT, DIM_SEJOUR, DIM_MEDICAMENT  ->  puis F6.
-   Rappel : DIM_SERVICE sert à F3, F4 et F5 (garder le flux existant).
-            DIM_VOIE_ADMINISTRATION n'existe pas dans le modèle : "route" est dans
-            DIM_MEDICAMENT, donc le flux DF_DIM_VOIE peut être désactivé.
+   Ordre SSIS :  DIM_TEMPS, DIM_PATIENT, DIM_SEJOUR, DIM_SERVICE, DIM_MEDICAMENT  ->  puis F6.
    ============================================================================= */
 
 USE HealthcareDW;
@@ -19,7 +21,7 @@ GO
 /* ========================== 1. CRÉATION DES TABLES ========================== */
 
 IF OBJECT_ID(N'dwh.FACT_PRESCRIPTION') IS NOT NULL DROP TABLE dwh.FACT_PRESCRIPTION;
-IF OBJECT_ID(N'dwh.DIM_MEDICAMENT')    IS NOT NULL DROP TABLE dwh.DIM_MEDICAMENT;   -- recréée avec les colonnes du modèle
+IF OBJECT_ID(N'dwh.DIM_MEDICAMENT')    IS NOT NULL DROP TABLE dwh.DIM_MEDICAMENT;
 GO
 
 IF OBJECT_ID(N'dwh.DIM_TEMPS') IS NULL
@@ -41,7 +43,7 @@ CREATE TABLE dwh.DIM_PATIENT (
     subject_id                int           NOT NULL CONSTRAINT uq_dim_patient UNIQUE,
     gender                    nvarchar(5)   NULL,
     dob                       date          NULL,
-    age                       smallint      NULL,   -- âge à la 1re admission ; 90 = "90 ans et plus"
+    age                       smallint      NULL,
     expire_flag               smallint      NULL,
     dod                       date          NULL,
     dod_hosp                  date          NULL,
@@ -65,7 +67,7 @@ IF OBJECT_ID(N'dwh.DIM_SEJOUR') IS NULL
 CREATE TABLE dwh.DIM_SEJOUR (
     sejour_sk            int IDENTITY(1,1) NOT NULL CONSTRAINT pk_dim_sejour PRIMARY KEY,
     hadm_id              int           NOT NULL CONSTRAINT uq_dim_sejour UNIQUE,
-    subject_id           int           NOT NULL,       -- lien vers DIM_PATIENT
+    subject_id           int           NOT NULL,
     admission_type       nvarchar(50)  NULL,
     admission_location   nvarchar(80)  NULL,
     discharge_location   nvarchar(80)  NULL,
@@ -82,32 +84,59 @@ CREATE TABLE dwh.DIM_SEJOUR (
 );
 GO
 
+/* [MODIF 2] DIM_SERVICE : créée seulement si elle n'existe pas (elle sert aussi à F3, F4, F5) */
+IF OBJECT_ID(N'dwh.DIM_SERVICE') IS NULL
+CREATE TABLE dwh.DIM_SERVICE (
+    service_sk       int IDENTITY(1,1) NOT NULL CONSTRAINT pk_dim_service PRIMARY KEY,
+    service_code     nvarchar(20)  NOT NULL CONSTRAINT uq_dim_service UNIQUE,
+    service_libelle  nvarchar(100) NULL
+);
+GO
+
+/* Ligne "service inconnu" (-1) : fonctionne que service_sk soit IDENTITY ou non */
+IF NOT EXISTS (SELECT 1 FROM dwh.DIM_SERVICE WHERE service_sk = -1)
+BEGIN
+    IF COLUMNPROPERTY(OBJECT_ID(N'dwh.DIM_SERVICE'), 'service_sk', 'IsIdentity') = 1
+    BEGIN
+        SET IDENTITY_INSERT dwh.DIM_SERVICE ON;
+        INSERT dwh.DIM_SERVICE (service_sk, service_code) VALUES (-1, N'INCONNU');
+        SET IDENTITY_INSERT dwh.DIM_SERVICE OFF;
+    END
+    ELSE
+        INSERT dwh.DIM_SERVICE (service_sk, service_code) VALUES (-1, N'INCONNU');
+END
+GO
+
+/* [MODIF 3] clé naturelle UNIQUE sur les 4 colonnes (610 car. = 1 220 octets, OK SQL Server 2016+) */
 CREATE TABLE dwh.DIM_MEDICAMENT (
     medicament_sk       int IDENTITY(1,1) NOT NULL CONSTRAINT pk_dim_medicament PRIMARY KEY,
     drug_name_generic   nvarchar(255) NOT NULL,
     drug                nvarchar(255) NOT NULL,
     drug_type           nvarchar(50)  NOT NULL,
-    route               nvarchar(50)  NOT NULL
+    route               nvarchar(50)  NOT NULL,
+    CONSTRAINT uq_dim_medicament UNIQUE (drug_name_generic, drug, drug_type, route)
 );
 GO
 
+/* [MODIF 1] service_sk ajouté */
 CREATE TABLE dwh.FACT_PRESCRIPTION (
     prescription_sk         int IDENTITY(1,1) NOT NULL CONSTRAINT pk_fact_prescription PRIMARY KEY,
-    row_id                  int NOT NULL CONSTRAINT uq_fact_prescription UNIQUE,   -- identifiant source
+    row_id                  int NOT NULL CONSTRAINT uq_fact_prescription UNIQUE,   -- identifiant source (dimension dégénérée)
     patient_sk              int NOT NULL CONSTRAINT fk_f6_patient REFERENCES dwh.DIM_PATIENT (patient_sk),
     sejour_sk               int NOT NULL CONSTRAINT fk_f6_sejour  REFERENCES dwh.DIM_SEJOUR (sejour_sk),
     date_start_sk           int NOT NULL CONSTRAINT fk_f6_start   REFERENCES dwh.DIM_TEMPS (date_sk),
     date_end_sk             int NOT NULL CONSTRAINT fk_f6_end     REFERENCES dwh.DIM_TEMPS (date_sk),   -- -1 si inconnue
     medicament_sk           int NOT NULL CONSTRAINT fk_f6_medic   REFERENCES dwh.DIM_MEDICAMENT (medicament_sk),
+    service_sk              int NOT NULL CONSTRAINT fk_f6_service REFERENCES dwh.DIM_SERVICE (service_sk),  -- -1 si inconnu
     dose                    decimal(18,4) NULL,   -- NULL si plage ("5-10") ou texte
-    dose_unite              nvarchar(20)  NULL,   -- ajout : sans l'unité, additionner des doses n'a pas de sens (à retirer si l'équipe refuse)
-    duree_traitement_jours  int           NULL,   -- NULL si date de fin inconnue
+    dose_unite              nvarchar(20)  NULL,
+    duree_traitement_jours  int           NULL,   -- date fin - date début ; NULL si fin inconnue
     nb_prescriptions        int NOT NULL CONSTRAINT df_f6_nb DEFAULT 1
 );
 GO
 
-/* ===================== 2. DIM_TEMPS (OLE DB Source, SQL command) ==================
-   Les dates MIMIC sont décalées : vos données vont de 2102 à 2202.                  */
+/* ===================== 2. DIM_TEMPS (OLE DB Source) =============================
+   Génère 2100-01-01 -> 2202-12-31 (37 620 jours) + ligne -1.                        */
 ;WITH n AS (
     SELECT TOP (DATEDIFF(DAY, '2100-01-01', '2203-01-01'))
            ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1 AS i
@@ -123,16 +152,11 @@ SELECT  CAST(CONVERT(char(8), dt, 112) AS int)      AS date_sk,
         CAST(DATENAME(WEEKDAY, dt) AS nvarchar(10)) AS jour_semaine
 FROM d;
 GO
--- Execute SQL Task APRÈS ce flux : la ligne "date inconnue"
+-- Execute SQL Task (déjà placée AVANT le flux dans votre package, c'est correct)
 IF NOT EXISTS (SELECT 1 FROM dwh.DIM_TEMPS WHERE date_sk = -1) INSERT dwh.DIM_TEMPS (date_sk) VALUES (-1);
 GO
-/* Heure / plage (nuit-jour) de l'image : impossible dans une table au grain "jour".
-   Si vous les voulez, il faut soit une DIM_HEURE séparée, soit une DIM_TEMPS au grain "heure". */
 
-/* ======================= 3. DIM_PATIENT (OLE DB Source) =======================
-   Dates PATIENTS en texte dans stg -> TRY_CONVERT (valeur invalide = NULL, pas d'erreur).
-   Email et city ne sont pas repris (non présents dans le modèle).
-   Âge : les patients de plus de 89 ans sont décalés de ~300 ans par MIMIC -> plafonné à 90. */
+/* ======================= 3. DIM_PATIENT (inchangée) ======================= */
 SELECT  TRY_CONVERT(int, p.subject_id)                                   AS subject_id,
         CAST(p.gender AS nvarchar(5))            AS gender,
         TRY_CONVERT(date, LEFT(CAST(p.dob AS nvarchar(30)), 10))         AS dob,
@@ -171,7 +195,7 @@ OUTER APPLY (SELECT MIN(TRY_CONVERT(date, LEFT(CAST(x.admittime AS nvarchar(30))
 WHERE TRY_CONVERT(int, p.subject_id) IS NOT NULL;
 GO
 
-/* ======================== 4. DIM_SEJOUR (OLE DB Source) ======================== */
+/* ======================== 4. DIM_SEJOUR (inchangée) ======================== */
 SELECT  TRY_CONVERT(int, hadm_id)                 AS hadm_id,
         TRY_CONVERT(int, subject_id)              AS subject_id,
         CAST(admission_type AS nvarchar(50))     AS admission_type,
@@ -191,10 +215,26 @@ FROM stg.ADMISSIONS
 WHERE TRY_CONVERT(int, hadm_id) IS NOT NULL;
 GO
 
-/* ===================== 5. DIM_MEDICAMENT (OLE DB Source) ======================
-   Un médicament = (nom générique, nom, type, voie).  Le nom générique manque dans 44,5 % des
-   lignes : on prend alors "drug".  UPPER/TRIM partout : le Lookup SSIS est sensible à la casse,
-   pas SQL Server ; la même expression doit être utilisée ici ET dans la source de la fait.   */
+/* ===================== 5. DIM_SERVICE (flux existant, inchangé) =================
+   Source du flux (déjà dans votre package) :                                        */
+SELECT DISTINCT
+    curr_service AS service_code,
+    CASE curr_service
+        WHEN 'CMED'  THEN 'Cardiologie médicale'   WHEN 'CSURG' THEN 'Chirurgie cardiaque'
+        WHEN 'GU'    THEN 'Génito-urinaire'        WHEN 'MED'   THEN 'Médecine générale'
+        WHEN 'NMED'  THEN 'Neurologie médicale'    WHEN 'NSURG' THEN 'Neurochirurgie'
+        WHEN 'OMED'  THEN 'Oncologie médicale'     WHEN 'ORTHO' THEN 'Orthopédie'
+        WHEN 'SURG'  THEN 'Chirurgie générale'     WHEN 'TRAUM' THEN 'Traumatologie'
+        WHEN 'TSURG' THEN 'Chirurgie thoracique'   WHEN 'VSURG' THEN 'Chirurgie vasculaire'
+        ELSE curr_service
+    END AS service_libelle
+FROM stg.SERVICES
+WHERE curr_service IS NOT NULL;
+GO
+
+/* ===================== 6. DIM_MEDICAMENT (OLE DB Source) ======================
+   Flux SSIS : Source -> Lookup (4 colonnes) -> "sans correspondance" -> Destination.
+   [MODIF 4] La sortie "avec correspondance" n'est reliée à RIEN (plus de UPDATE).    */
 SELECT DISTINCT
         CAST(UPPER(TRIM(COALESCE(NULLIF(TRIM(drug_name_generic), ''), drug))) AS nvarchar(255)) AS drug_name_generic,
         CAST(UPPER(TRIM(drug)) AS nvarchar(255))      AS drug,
@@ -204,39 +244,67 @@ FROM stg.PRESCRIPTIONS
 WHERE drug IS NOT NULL AND drug_type IS NOT NULL AND route IS NOT NULL;
 GO
 
-/* ================== 6. F6 = FACT_PRESCRIPTION (OLE DB Source) ===================
+/* ================== 7. F6 = FACT_PRESCRIPTION (OLE DB Source) ===================
    Avant : Execute SQL Task  ->  TRUNCATE TABLE dwh.FACT_PRESCRIPTION
    Grain : 1 ligne de prescription.
-   Ensuite 5 Lookups (Full cache, "No match" -> sortie d'erreur) :
-     subject_id   -> DIM_PATIENT.patient_sk
-     hadm_id      -> DIM_SEJOUR.sejour_sk
-     date_start_sk-> DIM_TEMPS.date_sk          date_end_sk -> DIM_TEMPS.date_sk (un 2e Lookup : même table, rôle "fin")
-     drug_name_generic + drug + drug_type + route (les 4 colonnes) -> DIM_MEDICAMENT.medicament_sk */
-SELECT  TRY_CONVERT(int, row_id)     AS row_id,
-        TRY_CONVERT(int, subject_id) AS subject_id,
-        TRY_CONVERT(int, hadm_id)    AS hadm_id,
-        CAST(CONVERT(char(8), TRY_CONVERT(date, LEFT(CAST(startdate AS nvarchar(30)),10)), 112) AS int)           AS date_start_sk,
-        ISNULL(CAST(CONVERT(char(8), TRY_CONVERT(date, LEFT(CAST(enddate AS nvarchar(30)),10)), 112) AS int), -1) AS date_end_sk,
-        CAST(UPPER(TRIM(COALESCE(NULLIF(TRIM(drug_name_generic), ''), drug))) AS nvarchar(255)) AS drug_name_generic,
-        CAST(UPPER(TRIM(drug)) AS nvarchar(255))      AS drug,
-        CAST(UPPER(TRIM(drug_type)) AS nvarchar(50))  AS drug_type,
-        CAST(UPPER(TRIM(route)) AS nvarchar(50))      AS route,
-        TRY_CONVERT(decimal(18,4), dose_val_rx) AS dose,
-        CAST(dose_unit_rx AS nvarchar(20))      AS dose_unite,
-        DATEDIFF(DAY, TRY_CONVERT(date, LEFT(CAST(startdate AS nvarchar(30)),10)),
-                      TRY_CONVERT(date, LEFT(CAST(enddate   AS nvarchar(30)),10))) AS duree_traitement_jours
-FROM stg.PRESCRIPTIONS
-WHERE drug IS NOT NULL AND drug_type IS NOT NULL AND route IS NOT NULL;
+   Lookups (Full cache, "Fail component") :
+     subject_id        -> DIM_PATIENT.patient_sk
+     hadm_id           -> DIM_SEJOUR.sejour_sk
+     service_code      -> DIM_SERVICE.service_sk          [MODIF 1]  (nouveau 4e Lookup)
+     drug_name_generic + drug + drug_type + route -> DIM_MEDICAMENT.medicament_sk
+   Les dates (date_start_sk / date_end_sk) n'ont pas de Lookup : la FK de la base les contrôle.
+
+   [MODIF 1] Service retenu = service actif au jour de début de la prescription
+             (dernier transfert <= date de début) ; sinon 1er service du séjour ;
+             sinon 'INCONNU' (-> -1).                                                  */
+SELECT  TRY_CONVERT(int, p.row_id)     AS row_id,
+        TRY_CONVERT(int, p.subject_id) AS subject_id,
+        TRY_CONVERT(int, p.hadm_id)    AS hadm_id,
+        CAST(CONVERT(char(8), c.start_d, 112) AS int)                    AS date_start_sk,
+        ISNULL(CAST(CONVERT(char(8), c.end_d, 112) AS int), -1)          AS date_end_sk,
+        CAST(UPPER(TRIM(COALESCE(NULLIF(TRIM(p.drug_name_generic), ''), p.drug))) AS nvarchar(255)) AS drug_name_generic,
+        CAST(UPPER(TRIM(p.drug)) AS nvarchar(255))      AS drug,
+        CAST(UPPER(TRIM(p.drug_type)) AS nvarchar(50))  AS drug_type,
+        CAST(UPPER(TRIM(p.route)) AS nvarchar(50))      AS route,
+        ISNULL(sv.service_code, N'INCONNU')             AS service_code,      -- [MODIF 1]
+        TRY_CONVERT(decimal(18,4), p.dose_val_rx) AS dose,
+        CAST(p.dose_unit_rx AS nvarchar(20))      AS dose_unite,
+        DATEDIFF(DAY, c.start_d, c.end_d)         AS duree_traitement_jours
+FROM stg.PRESCRIPTIONS p
+CROSS APPLY (SELECT TRY_CONVERT(date, LEFT(CAST(p.startdate AS nvarchar(30)),10)) AS start_d,
+                    TRY_CONVERT(date, LEFT(CAST(p.enddate   AS nvarchar(30)),10)) AS end_d) c
+OUTER APPLY (SELECT TOP (1) CAST(s.curr_service AS nvarchar(20)) AS service_code
+             FROM stg.SERVICES s
+             WHERE TRY_CONVERT(int, s.hadm_id) = TRY_CONVERT(int, p.hadm_id)
+               AND s.curr_service IS NOT NULL
+             ORDER BY CASE WHEN TRY_CONVERT(date, LEFT(CAST(s.transfertime AS nvarchar(30)),10)) <= c.start_d THEN 0 ELSE 1 END,
+                      CASE WHEN TRY_CONVERT(date, LEFT(CAST(s.transfertime AS nvarchar(30)),10)) <= c.start_d
+                           THEN TRY_CONVERT(datetime2(0), s.transfertime) END DESC,
+                      TRY_CONVERT(datetime2(0), s.transfertime) ASC) sv
+WHERE p.drug IS NOT NULL AND p.drug_type IS NOT NULL AND p.route IS NOT NULL;
 GO
+/* Destination : [dwh].[FACT_PRESCRIPTION]
+   Mappings : row_id, patient_sk, sejour_sk, date_start_sk, date_end_sk, medicament_sk,
+              service_sk (NOUVEAU), dose, dose_unite, duree_traitement_jours.
+   Sans lien : prescription_sk (identité) et nb_prescriptions (valeur par défaut 1).     */
 
-/* ============================== 7. CONTRÔLES =============================== */
+/* ============================== 8. CONTRÔLES =============================== */
 SELECT 'stg.PRESCRIPTIONS' AS t, COUNT(*) AS n FROM stg.PRESCRIPTIONS UNION ALL
-SELECT 'F6 FACT_PRESCRIPTION',   COUNT(*) FROM dwh.FACT_PRESCRIPTION UNION ALL   -- attendu = stg
-SELECT 'DIM_PATIENT (100)',      COUNT(*) FROM dwh.DIM_PATIENT UNION ALL
-SELECT 'DIM_SEJOUR (129)',       COUNT(*) FROM dwh.DIM_SEJOUR UNION ALL
-SELECT 'DIM_MEDICAMENT',         COUNT(*) FROM dwh.DIM_MEDICAMENT;
+SELECT 'F6 FACT_PRESCRIPTION (= stg)', COUNT(*) FROM dwh.FACT_PRESCRIPTION UNION ALL
+SELECT 'DIM_PATIENT (100)',        COUNT(*) FROM dwh.DIM_PATIENT UNION ALL
+SELECT 'DIM_SEJOUR (129)',         COUNT(*) FROM dwh.DIM_SEJOUR UNION ALL
+SELECT 'DIM_SERVICE (13 avec -1)', COUNT(*) FROM dwh.DIM_SERVICE UNION ALL
+SELECT 'DIM_MEDICAMENT (913)',     COUNT(*) FROM dwh.DIM_MEDICAMENT UNION ALL
+SELECT 'DIM_TEMPS (37 621)',       COUNT(*) FROM dwh.DIM_TEMPS;
 
-SELECT SUM(CASE WHEN dose IS NULL THEN 1 ELSE 0 END)                   AS doses_null,
-       SUM(CASE WHEN duree_traitement_jours IS NULL THEN 1 ELSE 0 END) AS durees_null,
-       SUM(CASE WHEN date_end_sk = -1 THEN 1 ELSE 0 END)               AS fin_inconnue
+SELECT SUM(CASE WHEN dose IS NULL THEN 1 ELSE 0 END)                   AS doses_null,             -- 681 attendu
+       SUM(CASE WHEN duree_traitement_jours IS NULL THEN 1 ELSE 0 END) AS durees_null,            -- 40 attendu
+       SUM(CASE WHEN duree_traitement_jours < 0 THEN 1 ELSE 0 END)     AS durees_negatives,       -- 0 attendu
+       SUM(CASE WHEN date_end_sk = -1 THEN 1 ELSE 0 END)               AS fin_inconnue,
+       SUM(CASE WHEN service_sk = -1 THEN 1 ELSE 0 END)                AS sans_service            -- 1 attendu
 FROM dwh.FACT_PRESCRIPTION;
+
+-- Test de relance : lancer le package 2 fois, ces 2 requêtes doivent donner le même résultat
+SELECT COUNT(*) AS nb_medicaments FROM dwh.DIM_MEDICAMENT;
+SELECT drug_name_generic, COUNT(*) AS nb_variantes
+FROM dwh.DIM_MEDICAMENT GROUP BY drug_name_generic HAVING COUNT(*) > 1;
